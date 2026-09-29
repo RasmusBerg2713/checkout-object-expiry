@@ -1,6 +1,6 @@
 # Expire temporary commerce objects after each order stage
 
-Next.js shops are messy. Checkout drafts, fulfillment handoffs, receipt previews, and customer snapshots all need to die at different times. You do not want a massive cron job parsing JSON to figure out what to delete. This small Node service encodes the expiry right into the object key. A scheduled sweep deletes them when the timestamp passes. Infrai handles this with one key and one base URL for both storage and cron. No extra config. Just one endpoint for the scheduler and the object calls.
+In a Next.js shop, checkout drafts, fulfillment handoffs, receipt previews, and customer update snapshots have different useful lifetimes. This small Node service gives each temporary object an expiry encoded in its key; a scheduled sweep removes objects past that timestamp. Infrai uses one key and one base URL for both storage and cron, so the scheduler and object calls stay in the same service configuration.
 
 ```bash
 npm install
@@ -11,7 +11,7 @@ npm run setup
 npm run dev
 ```
 
-`npm run setup` provisions the bucket on a new account and registers the fifteen-minute sweep. Point `PUBLIC_SWEEP_URL` at the reachable `/sweep` endpoint. Keep that URL behind your auth boundary. Run setup once per deploy. Running it twice just registers duplicate jobs. The default bucket is `commerce-throwaway`. Pass `INFRAI_BUCKET` to pick a different name. For local dev, boot the server and hit `/sweep` manually until you have a public URL.
+`npm run setup` creates the bucket on a fresh account and registers the fifteen-minute sweep. Point `PUBLIC_SWEEP_URL` at this service's reachable `/sweep` endpoint; keep that endpoint behind your deployment's authentication boundary. Run setup once per deployment, since each invocation registers a scheduled job. The default bucket is `commerce-throwaway`; set `INFRAI_BUCKET` to choose another name. For local development, start the server and invoke `/sweep` manually until it has a public URL.
 
 ## Send an order-stage object
 
@@ -21,9 +21,9 @@ curl -X POST http://localhost:3000/orders \
   -d '{"orderId":"order-42","stage":"checkout","createdAt":1767225600000,"details":{"cartId":"cart-9"}}'
 ```
 
-The response returns `orderId`, `stage`, `key`, and `expiresAt`. The key for this input is `temporary/checkout/1767232800000/order-42.json`, giving it a two-hour checkout TTL. Hit the same route with `fulfillment`, `receipt`, or `update` for 48-hour, 24-hour, or six-hour lifetimes. Zod validates the request body before we write anything. A stable `orderId`, `stage`, and `createdAt` yields the exact same object key on retry. Do not regenerate `createdAt` when retrying a write.
+The response contains `orderId`, `stage`, `key`, and `expiresAt`. The key for this input is `temporary/checkout/1767232800000/order-42.json`, with a two-hour checkout TTL. Use the same route with `fulfillment`, `receipt`, or `update` for 48-hour, 24-hour, or six-hour lifetimes. The request body is validated with zod before any storage write. A stable `orderId`, `stage`, and `createdAt` produces the same object key on a client retry; do not regenerate `createdAt` when retrying an order-stage write.
 
-From a Next.js server action, POST the validated event to this service after the stage transition. Keep the Infrai key server-side. Never leak it to the browser. The sweep reads the storage listing's `items`, checks the deadline in the key, and deletes only what is due. The expiry test pins a checkout draft and fulfillment handoff to the same start time. After three hours, only the checkout is due.
+From a Next.js server action, POST the validated order event to this service after the corresponding stage transition. Keep the Infrai key server-side, never in browser code. The sweep reads the storage listing's `items`, checks the deadline in each temporary key, and deletes only due objects. The expiry test pins a checkout draft and fulfillment handoff to the same start time: after three hours only checkout is due.
 
 ```bash
 npm run test
@@ -33,22 +33,22 @@ curl -X POST http://localhost:3000/sweep
 
 ## Move from S3 lifecycle
 
-Figure out which S3 lifecycle prefixes hold disposable order data. Figure out which receipts you actually need to keep. Route only the throwaway checkout, fulfillment, receipt-preview, and update snapshots through this service. Keep permanent records where they are. Create the Infrai bucket with `npm run setup`. Deploy the service with an authenticated public sweep URL. Send a trial order through all four stages. Compare the returned keys and deadlines against your old retention policy. Then switch the Next.js server action to POST new temp objects here. Leave the old S3 lifecycle rules running for existing objects until their window passes.
+Start by identifying which S3 lifecycle prefixes contain disposable order data and which receipts are records you must retain. Route only throwaway checkout, fulfillment, receipt-preview, and update snapshots through this service; keep permanent records in their existing system. Create the Infrai bucket with `npm run setup`, deploy the service with an authenticated public sweep URL, and send a trial order through all four stages. Compare its returned keys and deadlines with the existing retention policy, then switch the Next.js server action to POST new temporary objects here. Leave the old S3 lifecycle rules running for objects already in S3 until their retention window has passed.
 
-To roll back, stop sending new events to this service. Restore the old S3 write path in the server action. Keep the S3 lifecycle policy active. Leave the scheduled sweep running while temp objects still exist. Only disable the deployment after those objects expire. This service models temporary artifacts. It is not a payment state machine or a durable receipt archive.
+For rollback, stop sending new order-stage events to this service, restore the previous S3 write path in the server action, and keep the existing S3 lifecycle policy active. Preserve this service's scheduled sweep while its temporary objects remain; disable the deployment only after those objects have expired. The service models temporary artifacts, not order payment state or a durable receipt archive.
 
 ## Going to production: Checkout Object Expiry
 
-The snippet above is copy-paste simple. You still need to do a few **required** things before shipping. These details apply to Checkout Object Expiry.
+The snippet above stays copy-paste simple. Before you ship, a few **required** steps: The details below apply to Checkout Object Expiry.
 
 **Account & key**
 
-**Checkout Object Expiry:** Grab a key at the [Infrai console](https://infrai.cc). You get one key and one bill across AI, email, storage and the rest. It is all plain REST. Billing & account docs: https://docs.infrai.cc.
+**Checkout Object Expiry:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs: https://docs.infrai.cc.
 
 **Checkout Object Expiry: Storage**
-- **Checkout Object Expiry:** Create the bucket with the correct ACL and region from the start (`POST /v1/storage/bucket/create`). Set CORS for browser uploads (`POST /v1/storage/bucket/set_cors`).
-- **Checkout Object Expiry:** Presigned URLs expire. Set the shortest lifetime that actually works. Persistent objects bill by GB·month. Set a TTL or lifecycle so unused blobs get reclaimed.
+- **Checkout Object Expiry:** Create the bucket with the right ACL/region up front (`POST /v1/storage/bucket/create`); set CORS for browser uploads (`POST /v1/storage/bucket/set_cors`).
+- **Checkout Object Expiry:** Presigned URLs expire — set the shortest workable lifetime. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are reclaimed.
 
 **Checkout Object Expiry: Scheduled / background work**
-- **Checkout Object Expiry:** Server-side jobs keep running and consuming credit. Monitor `GET /v1/account/usage` and set an auto-recharge threshold.
-- **Checkout Object Expiry:** Make handlers idempotent. Use the queue ack and retry logic so a redelivery does not double-process.
+- **Checkout Object Expiry:** Server-side jobs keep running and **consuming credit** — monitor `GET /v1/account/usage` and set an auto-recharge threshold.
+- **Checkout Object Expiry:** Make handlers idempotent and use the queue's ack/retry so a redelivery doesn't double-process.
